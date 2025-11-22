@@ -1,7 +1,7 @@
 #This both we will have to be installed before being able to run the code properly. Flightradar24 API has been changed so to be to use it
 # you will have to purchase the premium version;
 
-ttps://www.flightradar24.com/premium/
+https://www.flightradar24.com/premium/
 
 flightradar24
 beautifulsoup4
