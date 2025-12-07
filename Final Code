@@ -14,18 +14,14 @@ from matplotlib.figure import Figure
 # 1. CONFIG – FILL THESE OUT
 # ============================================================
 
-# --- Twilio (for SMS notifications) ---
-ENABLE_SMS = False  # change to True after adding your credentials
+ENABLE_SMS = False  # Change to True after adding credentials
 
 TWILIO_SID = "YOUR_TWILIO_ACCOUNT_SID"
 TWILIO_AUTH = "YOUR_TWILIO_AUTH_TOKEN"
-TWILIO_PHONE = "+1234567890"   # your Twilio number
-USER_PHONE = "+1234567890"     # user's phone number
+TWILIO_PHONE = "+1234567890"
+USER_PHONE = "+1234567890"
 
-if ENABLE_SMS:
-    twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
-else:
-    twilio_client = None
+twilio_client = Client(TWILIO_SID, TWILIO_AUTH) if ENABLE_SMS else None
 
 
 # ============================================================
@@ -33,26 +29,29 @@ else:
 # ============================================================
 
 def get_flight_status(airline, flight_number):
-    """
-    Scrapes FlightStats public flight tracker page for basic status.
-    Example URL: https://www.flightstats.com/v2/flight-tracker/AA/100
-
-    Returns dict with:
-    - status
-    - scheduled_dep, actual_dep
-    - scheduled_arr, actual_arr
-    """
     url = f"https://www.flightstats.com/v2/flight-tracker/{airline}/{flight_number}"
     headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers, timeout=15)
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+    except Exception:
+        return {
+            "status": "Unknown",
+            "scheduled_dep": "Unknown",
+            "actual_dep": "Unknown",
+            "scheduled_arr": "Unknown",
+            "actual_arr": "Unknown",
+            "source_url": url,
+        }
 
     soup = BeautifulSoup(resp.content, "html.parser")
 
-    # Status (high-level)
+    # Status
     status_tag = soup.find("div", class_="text-helper__TextHelper-sc-8bko4a-0")
     status = status_tag.text.strip() if status_tag else "Unknown"
 
-    # Times (these selectors may change if FlightStats changes layout)
+    # Times
     times = soup.find_all("div", class_="text-helper__TextHelper-sc-8bko4a-0 kbHzdx")
     if len(times) >= 4:
         scheduled_dep = times[0].text.strip()
@@ -74,18 +73,11 @@ def get_flight_status(airline, flight_number):
 
 def get_flight_position(airline, flight_number):
     """
-    Uses FlightRadar24 public JSON feed to approximate current position.
-
-    Note: This is a best-effort heuristic and may break if FR24 changes API.
-    It scans all flights and tries to match by callsign (airline+number).
-
-    Returns:
-        dict with lat, lon, altitude, speed
-        or None if not found.
+    Python 3.14-safe: filtered metadata fields to avoid crashes.
     """
-    # Global feed of aircraft
-    url = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js?bounds=85,-85,-179,179"
+    url = "https://data-cloud.flightradar24.com/zones/fcgi/feed.js"
     params = {
+        "bounds": "85,-85,-179,179",
         "faa": "1",
         "satellite": "1",
         "mlat": "1",
@@ -99,29 +91,29 @@ def get_flight_position(airline, flight_number):
         "gliders": "0",
         "stats": "0",
     }
-    headers = {"User-Agent": "Mozilla/5.0"}
 
-    resp = requests.get(url, params=params, headers=headers, timeout=15)
-    data = resp.json()
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
 
     callsign_target = f"{airline}{flight_number}".upper()
 
     for key, value in data.items():
         if not isinstance(value, list):
             continue
-        # FR24 typical format: [0, lat, lon, track, altitude, speed, ... callsign at index ~13]
+
+        # FR24 flight array
         if len(value) > 13:
-            callsign = str(value[13]).upper() if value[13] else ""
+            callsign = (value[13] or "").upper()
             if callsign_target in callsign:
-                lat = value[1]
-                lon = value[2]
-                altitude = value[4]
-                speed = value[5]
                 return {
-                    "lat": lat,
-                    "lon": lon,
-                    "altitude": altitude,
-                    "speed": speed,
+                    "lat": value[1],
+                    "lon": value[2],
+                    "altitude": value[4],
+                    "speed": value[5],
                     "callsign": callsign,
                 }
 
@@ -129,108 +121,109 @@ def get_flight_position(airline, flight_number):
 
 
 def send_sms(message):
-    """Send SMS via Twilio, if enabled."""
     if not ENABLE_SMS or twilio_client is None:
         print("[SMS DISABLED] Would have sent:", message)
         return
 
-    twilio_client.messages.create(
-        body=message,
-        from_=TWILIO_PHONE,
-        to=USER_PHONE,
-    )
-    print("[SMS SENT]", message)
+    try:
+        twilio_client.messages.create(
+            body=message,
+            from_=TWILIO_PHONE,
+            to=USER_PHONE,
+        )
+    except Exception as e:
+        print("[SMS ERROR]", e)
 
 
 # ============================================================
-# 3. GUI APP CLASS
+# 3. GUI APP (Python 3.14 Safe)
 # ============================================================
 
 class FlightTrackerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Flight Tracker – Live Status + Map")
-        self.root.geometry("900x600")
+        self.root.geometry("950x600")
 
-        # Tracking state
+        # Vars
         self.tracking = False
         self.airline = ""
         self.flight_number = ""
-        self.poll_interval_ms = 120000  # 2 minutes
+        self.poll_interval_ms = 120000
 
         self.last_status = None
         self.landing_notified = False
         self.delay_notified = False
 
-        # Build UI
+        # UI
         self._build_controls()
         self._build_status_panel()
         self._build_map()
 
-    # -------------------- UI construction --------------------
+    # ---------------------------------------------------------
+    # UI BUILDERS
+    # ---------------------------------------------------------
 
     def _build_controls(self):
         frame = tk.Frame(self.root)
         frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
 
-        tk.Label(frame, text="Airline Code (AA, DL, UA, etc.):").grid(row=0, column=0, sticky="w")
+        tk.Label(frame, text="Airline Code (AA, DL, UA):").grid(row=0, column=0, sticky="w")
         self.entry_airline = tk.Entry(frame, width=10)
-        self.entry_airline.grid(row=0, column=1, padx=5)
+        self.entry_airline.grid(row=0, column=1)
 
         tk.Label(frame, text="Flight Number:").grid(row=0, column=2, sticky="w")
         self.entry_flight = tk.Entry(frame, width=10)
-        self.entry_flight.grid(row=0, column=3, padx=5)
+        self.entry_flight.grid(row=0, column=3)
 
         self.btn_start = tk.Button(frame, text="Start Tracking", command=self.start_tracking)
         self.btn_start.grid(row=0, column=4, padx=10)
 
         self.btn_stop = tk.Button(frame, text="Stop", command=self.stop_tracking, state=tk.DISABLED)
-        self.btn_stop.grid(row=0, column=5, padx=5)
+        self.btn_stop.grid(row=0, column=5)
 
     def _build_status_panel(self):
         frame = tk.LabelFrame(self.root, text="Flight Status", padx=10, pady=10)
         frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.label_status = tk.Label(frame, text="Status: --", anchor="w", justify="left")
+        self.label_status = tk.Label(frame, text="Status: --", anchor="w")
         self.label_status.pack(fill=tk.X)
 
-        self.label_dep = tk.Label(frame, text="Departure (Sched / Actual): -- / --", anchor="w", justify="left")
-        self.label_dep.pack(fill=tk.X, pady=5)
+        self.label_dep = tk.Label(frame, text="Departure: -- / --", anchor="w")
+        self.label_dep.pack(fill=tk.X)
 
-        self.label_arr = tk.Label(frame, text="Arrival (Sched / Actual): -- / --", anchor="w", justify="left")
-        self.label_arr.pack(fill=tk.X, pady=5)
+        self.label_arr = tk.Label(frame, text="Arrival: -- / --", anchor="w")
+        self.label_arr.pack(fill=tk.X)
 
-        self.label_last_update = tk.Label(frame, text="Last Update: --", anchor="w", justify="left")
-        self.label_last_update.pack(fill=tk.X, pady=5)
+        self.label_last_update = tk.Label(frame, text="Last Update: --", anchor="w")
+        self.label_last_update.pack(fill=tk.X)
 
     def _build_map(self):
         frame = tk.LabelFrame(self.root, text="Real-Time Map", padx=10, pady=10)
         frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.fig = Figure(figsize=(4, 4), dpi=100)
+        self.fig = Figure(figsize=(5, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Aircraft Position")
-        self.ax.set_xlabel("Longitude")
-        self.ax.set_ylabel("Latitude")
         self.ax.set_xlim(-180, 180)
         self.ax.set_ylim(-90, 90)
         self.ax.grid(True)
 
-        # Initialize an empty point (we'll update its data later)
         self.plane_point, = self.ax.plot([], [], marker="o", markersize=8)
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
+        self.canvas = FigureCanvasTkAgg(self.fig, frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.canvas.draw()
 
-    # -------------------- Tracking logic --------------------
+    # ---------------------------------------------------------
+    # Tracking Logic
+    # ---------------------------------------------------------
 
     def start_tracking(self):
         airline = self.entry_airline.get().strip().upper()
         flight_number = self.entry_flight.get().strip()
 
         if not airline or not flight_number:
-            messagebox.showerror("Error", "Please enter both airline code and flight number.")
+            messagebox.showerror("Error", "Enter airline and flight number.")
             return
 
         self.airline = airline
@@ -244,14 +237,8 @@ class FlightTrackerApp:
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
 
-        # Initial immediate poll
         self.poll_flight()
-
-        # Schedule periodic polling
         self.root.after(self.poll_interval_ms, self.poll_flight)
-
-        if ENABLE_SMS:
-            send_sms(f"Now tracking flight {self.airline} {self.flight_number}. You will receive live updates.")
 
     def stop_tracking(self):
         self.tracking = False
@@ -264,81 +251,70 @@ class FlightTrackerApp:
             return
 
         try:
-            # 1) Get status
             status_data = get_flight_status(self.airline, self.flight_number)
             status_text = status_data["status"]
-            self.update_status_panel(status_data)
 
-            # 2) Notify on status change / events
+            self.update_status_panel(status_data)
             self.handle_notifications(status_text, status_data)
 
-            # 3) Get position
             position_data = get_flight_position(self.airline, self.flight_number)
             self.update_map(position_data)
 
         except Exception as e:
-            print("Error while polling flight:", e)
-            self.label_last_update.config(text=f"Last Update: Error - {e}")
+            print("Error:", e)
+            self.label_last_update.config(text=f"Error: {e}")
 
-        # Re-schedule next poll
         if self.tracking:
             self.root.after(self.poll_interval_ms, self.poll_flight)
 
-    # -------------------- UI update helpers --------------------
+    # ---------------------------------------------------------
+    # UI UPDATE HELPERS
+    # ---------------------------------------------------------
 
     def update_status_panel(self, data):
         self.label_status.config(text=f"Status: {data['status']}")
-        self.label_dep.config(
-            text=f"Departure (Sched / Actual): {data['scheduled_dep']} / {data['actual_dep']}"
-        )
-        self.label_arr.config(
-            text=f"Arrival (Sched / Actual): {data['scheduled_arr']} / {data['actual_arr']}"
-        )
-        self.label_last_update.config(
-            text=f"Last Update: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        self.label_dep.config(text=f"Departure: {data['scheduled_dep']} / {data['actual_dep']}")
+        self.label_arr.config(text=f"Arrival: {data['scheduled_arr']} / {data['actual_arr']}")
+        self.label_last_update.config(text=f"Last Update: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     def update_map(self, pos):
         if pos is None:
-            # No position found – clear point
             self.plane_point.set_data([], [])
+            self.ax.set_title("No Aircraft Data")
         else:
-            lon = pos["lon"]
-            lat = pos["lat"]
-            self.plane_point.set_data([lon], [lat])
+            self.plane_point.set_data([pos['lon']], [pos['lat']])
             self.ax.set_title(
-                f"Aircraft Position ({pos['callsign']})\nAlt: {pos['altitude']} ft | Speed: {pos['speed']} kt"
+                f"{pos['callsign']} | Alt {pos['altitude']} ft | Speed {pos['speed']} kt"
             )
 
+        # Python 3.14-safe redraw
         self.canvas.draw_idle()
 
-    # -------------------- Notifications --------------------
+    # ---------------------------------------------------------
+    # Notifications
+    # ---------------------------------------------------------
 
     def handle_notifications(self, status_text, status_data):
         status_lower = status_text.lower()
 
-        # Notify on any status change
+        # Generic status change
         if status_text != self.last_status:
-            msg = (
-                f"✈️ Flight Update: {self.airline} {self.flight_number}\n"
+            send_sms(
+                f"Flight {self.airline}{self.flight_number} Update:\n"
                 f"Status: {status_data['status']}\n"
-                f"Departure (Sched/Actual): {status_data['scheduled_dep']} / {status_data['actual_dep']}\n"
-                f"Arrival (Sched/Actual): {status_data['scheduled_arr']} / {status_data['actual_arr']}"
+                f"Departure: {status_data['scheduled_dep']} / {status_data['actual_dep']}\n"
+                f"Arrival: {status_data['scheduled_arr']} / {status_data['actual_arr']}"
             )
-            send_sms(msg)
             self.last_status = status_text
 
-        # Notify specifically when landing/landed/arrived
-        if (("landed" in status_lower or "arrived" in status_lower or "arrival" in status_lower)
-                and not self.landing_notified):
-            msg = f"🛬 Flight {self.airline} {self.flight_number} has LANDED/ARRIVED.\nStatus: {status_text}"
-            send_sms(msg)
+        # Landing alert
+        if any(word in status_lower for word in ["landed", "arrived"]) and not self.landing_notified:
+            send_sms(f"Flight {self.airline}{self.flight_number} has LANDED.")
             self.landing_notified = True
 
-        # Notify when delayed (once)
-        if (("delay" in status_lower or "late" in status_lower) and not self.delay_notified):
-            msg = f"⚠️ Flight {self.airline} {self.flight_number} is DELAYED.\nStatus: {status_text}"
-            send_sms(msg)
+        # Delay alert
+        if ("delay" in status_lower or "late" in status_lower) and not self.delay_notified:
+            send_sms(f"Flight {self.airline}{self.flight_number} is DELAYED.")
             self.delay_notified = True
 
 
@@ -350,3 +326,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = FlightTrackerApp(root)
     root.mainloop()
+
